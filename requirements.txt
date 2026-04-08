@@ -1,0 +1,23 @@
+# FastAPI and server dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+
+# LiveKit SDK (using correct package names)
+livekit>=1.1.2
+livekit-api>=0.6.0
+
+# AWS SDK for S3 storage
+boto3>=1.34.0
+
+# Groq API for transcription and AI summary
+groq>=0.4.0
+
+# Additional utilities
+pydantic>=2.5.0
+typing-extensions>=4.8.0
+
+# Test dependencies (optional)
+pytest>=7.0.0
+httpx>=0.24.0

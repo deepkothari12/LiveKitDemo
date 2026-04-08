@@ -1,0 +1,7 @@
+recordings
+transcript
+.env
+.venv
+ARCHITECTURE.md
+*.log
+setup.py
