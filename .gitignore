@@ -1,7 +1,30 @@
-recordings
-transcript
+# Environment variables (contains secrets)
 .env
-.venv
-ARCHITECTURE.md
+.env.local
+
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+
+# Logs
 *.log
+
+# Temporary recordings and transcripts
+recordings/
+transcripts/
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Setup script (not needed for deployment)
 setup.py
+
+*.md
+
+colab_server_improved.py

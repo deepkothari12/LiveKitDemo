@@ -53,6 +53,9 @@ AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 # Groq API Configuration
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
+# Colab LLM API Configuration
+COLAB_API_URL = os.getenv('COLAB_API_URL')
+
 # Local recordings directory (fallback)
 RECORDINGS_DIR = Path("recordings")
 RECORDINGS_DIR.mkdir(exist_ok=True)
@@ -460,17 +463,26 @@ async def process_recording_async(recording_data: Dict):
     room_name = recording_data['roomName']
     audio_s3_key = recording_data.get('audioS3Key')
 
+    logger.info(f"{'='*60}")
+    logger.info(f"🎬 STARTING RECORDING PROCESSING PIPELINE")
+    logger.info(f"{'='*60}")
+    logger.info(f"📍 Room: {room_name}")
+    logger.info(f"📁 S3 Key: {audio_s3_key}")
+    logger.info(f"⏱️ Duration: {recording_data.get('duration', 0):.1f}s")
+    logger.info(f"👤 Started by: {recording_data.get('startedBy', 'unknown')}")
+
     if not audio_s3_key:
-        logger.error(f"No audio S3 key provided for room \"{room_name}\"")
+        logger.error(f"❌ No audio S3 key provided for room \"{room_name}\"")
         return
 
     try:
-        logger.info(f"🎙️ Starting transcription for room \"{room_name}\"")
-
+        logger.info(f"⏳ Step 1/7: Waiting 10 seconds for S3 upload to complete...")
         # Wait a bit for S3 upload to complete
         await asyncio.sleep(10)
+        logger.info(f"✅ Step 1/7: Wait complete, proceeding to S3 client initialization")
 
-        # Download audio from S3
+        logger.info(f"⏳ Step 2/7: Initializing AWS S3 client...")
+        # Initialize S3 client
         import boto3
         s3_client = boto3.client(
             's3',
@@ -478,39 +490,68 @@ async def process_recording_async(recording_data: Dict):
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
             region_name=AWS_S3_REGION
         )
+        logger.info(f"✅ Step 2/7: S3 client initialized successfully")
+        logger.info(f"   📦 Bucket: {AWS_S3_BUCKET}")
+        logger.info(f"   🌍 Region: {AWS_S3_REGION}")
 
-        # Download audio file temporarily
-        local_audio_path = f"recordings/{room_name}_audio.mp3"
-        os.makedirs("recordings", exist_ok=True)
-
+        # ═══════════════════════════════════════════════════════════════
+        # TRANSCRIPTION - Using Colab LLM with S3 Presigned URL
+        # ═══════════════════════════════════════════════════════════════
+        
+        logger.info(f"⏳ Step 3/7: Generating S3 presigned URL...")
+        # Generate temporary presigned URL (valid for 1 hour)
         try:
-            s3_client.download_file(AWS_S3_BUCKET, audio_s3_key, local_audio_path)
-            logger.info(f"📥 Downloaded audio from S3: {audio_s3_key}")
+            presigned_url = s3_client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': AWS_S3_BUCKET,
+                    'Key': audio_s3_key
+                },
+                ExpiresIn=3600  # URL expires in 1 hour
+            )
+            logger.info(f"✅ Step 3/7: Presigned URL generated successfully")
+            logger.info(f"   🔗 URL: {presigned_url[:80]}...")
+            logger.info(f"   ⏰ Expires in: 1 hour (3600 seconds)")
         except Exception as e:
-            logger.error(f"Failed to download audio from S3: {e}")
+            logger.error(f"❌ Step 3/7 FAILED: Could not generate presigned URL: {e}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
             return
 
-        # Check if audio file exists locally now
-        if not os.path.exists(local_audio_path):
-            logger.error(f"Audio file not found after download: {local_audio_path}")
-            return
-
-        logger.info(f"📥 Audio file ready: {local_audio_path}")
-
-        # Transcribe using Groq Whisper
-        transcript = await transcribe_audio(local_audio_path)
+        logger.info(f"⏳ Step 4/7: Sending audio URL to Colab LLM for transcription...")
+        logger.info(f"   🎯 Target: {COLAB_API_URL}")
+        logger.info(f"   📍 Room: {room_name}")
+        logger.info(f"   ⚠️ This may take a while for long recordings...")
+        logger.info(f"   ⏱️ Estimated time: ~{int(recording_data.get('duration', 0) / 30 * 20)} seconds for {int(recording_data.get('duration', 0) / 30)} chunks")
+        
+        # Send audio URL to Colab LLM for transcription
+        transcript = await transcribe_audio_colab(presigned_url, room_name)
 
         if not transcript:
-            logger.error(f"Transcription failed for room \"{room_name}\"")
+            logger.error(f"❌ Step 4/7 FAILED: Transcription failed for room \"{room_name}\"")
+            logger.error(f"   ⚠️ Check Colab server logs for details")
+            logger.error(f"   ⚠️ Verify COLAB_API_URL is correct: {COLAB_API_URL}")
             return
 
-        logger.info(f"✅ Transcription complete for room \"{room_name}\" ({len(transcript)} chars)")
+        logger.info(f"✅ Step 4/7: Transcription received from Colab")
+        logger.info(f"   📝 Length: {len(transcript)} characters")
+        logger.info(f"   📄 Preview: {transcript[:100]}...")
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"🎯 COLAB MODEL OUTPUT - TRANSCRIPTION")
+        logger.info(f"{'='*60}")
+        logger.info(f"{transcript}")
+        logger.info(f"{'='*60}")
+        logger.info(f"✅ Above transcription was generated by YOUR COLAB LLM MODEL")
+        logger.info(f"{'='*60}")
+        logger.info(f"")
 
+        logger.info(f"⏳ Step 5/7: Generating AI summary using Groq Llama...")
         # Generate summary using Groq Llama
         summary = await generate_summary(transcript, recording_data)
 
         if not summary:
-            logger.warning(f"Summary generation failed for room {room_name}, using fallback")
+            logger.warning(f"⚠️ Step 5/7: Summary generation failed for room {room_name}, using fallback")
             # Create fallback summary structure
             summary = {
                 'summary': 'Summary generation failed. Please review the transcript below.',
@@ -518,9 +559,13 @@ async def process_recording_async(recording_data: Dict):
                 'important_points': [],
                 'action_items': []
             }
+        else:
+            logger.info(f"✅ Step 5/7: Summary generated successfully")
+            logger.info(f"   🎯 Key topics: {len(summary.get('key_topics', []))}")
+            logger.info(f"   💡 Important points: {len(summary.get('important_points', []))}")
+            logger.info(f"   ✓ Action items: {len(summary.get('action_items', []))}")
 
-        logger.info(f"Summary processed for room {room_name}")
-
+        logger.info(f"⏳ Step 6/7: Storing summary in memory...")
         # Store summary
         meeting_summaries[room_name] = {
             'transcript': transcript,
@@ -529,7 +574,9 @@ async def process_recording_async(recording_data: Dict):
             'duration': recording_data['duration'],
             'startedBy': recording_data['startedBy']
         }
+        logger.info(f"✅ Step 6/7: Summary stored in memory (accessible via API)")
 
+        logger.info(f"⏳ Step 7/7: Creating and saving transcript files...")
         # Create comprehensive transcript file with summary
         transcript_dir = Path("transcripts")
         transcript_dir.mkdir(exist_ok=True)
@@ -537,6 +584,8 @@ async def process_recording_async(recording_data: Dict):
         timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
         transcript_filename = f"{room_name}_{timestamp_str}_transcript.txt"
         transcript_path = transcript_dir / transcript_filename
+        
+        logger.info(f"   📁 Local path: {transcript_path}")
 
         # Format complete transcript with summary
         transcript_content = f"""MEETING TRANSCRIPT & SUMMARY
@@ -599,12 +648,13 @@ End of Meeting Transcript
 """
 
         # Save transcript locally
+        logger.info(f"   💾 Saving to local file...")
         with open(transcript_path, 'w', encoding='utf-8') as f:
             f.write(transcript_content)
-
-        logger.info(f"💾 Transcript saved locally: {transcript_path}")
+        logger.info(f"   ✅ Local file saved: {transcript_path}")
 
         # Upload transcript to S3
+        logger.info(f"   ☁️ Uploading to S3...")
         try:
             s3_transcript_key = f"recordings/{room_name}/{timestamp_str}_transcript.txt"
 
@@ -614,60 +664,166 @@ End of Meeting Transcript
                 s3_transcript_key
             )
 
-            logger.info(f"☁️ Transcript uploaded to S3: s3://{AWS_S3_BUCKET}/{s3_transcript_key}")
+            logger.info(f"   ✅ S3 upload successful: s3://{AWS_S3_BUCKET}/{s3_transcript_key}")
 
         except Exception as s3_err:
-            logger.error(f"Failed to upload transcript to S3: {s3_err}")
+            logger.error(f"   ⚠️ S3 upload failed: {s3_err}")
+            logger.error(f"   ℹ️ Local copy is still available at: {transcript_path}")
             # Continue even if S3 upload fails - we have local copy
 
-        # Clean up temp audio file
-        if os.path.exists(local_audio_path):
-            os.remove(local_audio_path)
-            logger.info(f"🗑️ Cleaned up temp file: {local_audio_path}")
-
-        logger.info(f"🎉 Meeting summary ready for room \"{room_name}\"")
+        logger.info(f"✅ Step 7/7: Files saved successfully")
+        logger.info(f"{'='*60}")
+        logger.info(f"🎉 PROCESSING COMPLETE FOR ROOM: {room_name}")
+        logger.info(f"{'='*60}")
+        logger.info(f"📊 Summary Statistics:")
+        logger.info(f"   📝 Transcript: {len(transcript)} characters")
+        logger.info(f"   ⏱️ Duration: {int(recording_data['duration'] / 60)}m {int(recording_data['duration'] % 60)}s")
+        logger.info(f"   📄 File: {transcript_filename}")
+        logger.info(f"   📍 Local: {transcript_path}")
+        logger.info(f"   ☁️ S3: recordings/{room_name}/{timestamp_str}_transcript.txt")
+        logger.info(f"{'='*60}")
         logger.info(f"📄 Transcript file: {transcript_filename}")
         logger.info(f"📍 Local: {transcript_path}")
         logger.info(f"☁️ S3: s3://{AWS_S3_BUCKET}/recordings/{room_name}/{timestamp_str}_transcript.txt")
 
     except Exception as err:
-        logger.error(f"Error processing recording for room \"{room_name}\": {err}")
+        logger.error(f"{'='*60}")
+        logger.error(f"❌ PROCESSING FAILED FOR ROOM: {room_name}")
+        logger.error(f"{'='*60}")
+        logger.error(f"Error: {err}")
         import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
+        logger.error(f"{'='*60}")
 
 
 
-async def transcribe_audio(audio_file_path: str) -> Optional[str]:
-    """Transcribe audio using Groq Whisper API"""
+async def transcribe_audio_colab(audio_url: str, room_name: str) -> Optional[str]:
+    """
+    Transcribe audio using Colab LLM API with S3 presigned URL
+    
+    Args:
+        audio_url: S3 presigned URL to the audio file
+        room_name: Room name for logging purposes
+    
+    Returns:
+        Transcription text or None if failed
+    """
+    logger.info(f"   ┌─────────────────────────────────────────────────")
+    logger.info(f"   │ COLAB API CALL - DETAILED LOG")
+    logger.info(f"   ├─────────────────────────────────────────────────")
+    
+    if not COLAB_API_URL:
+        logger.error(f"   │ ❌ COLAB_API_URL not configured in .env file")
+        logger.error(f"   │ ℹ️ Add: COLAB_API_URL=https://your-ngrok-url.ngrok-free.dev/transcribe")
+        logger.info(f"   └─────────────────────────────────────────────────")
+        return None
+    
     try:
-        groq = get_groq_client()
-        if not groq:
-            logger.error("Groq client not initialized (missing API key)")
+        import requests
+        from datetime import datetime
+        
+        logger.info(f"   │ 🎯 Target URL: {COLAB_API_URL}")
+        logger.info(f"   │ 📍 Room: {room_name}")
+        logger.info(f"   │ 🔗 Audio URL: {audio_url[:80]}...")
+        logger.info(f"   │ ⏱️ Timeout: None (unlimited - can handle any duration)")
+        logger.info(f"   ├─────────────────────────────────────────────────")
+        
+        start_time = datetime.now()
+        logger.info(f"   │ 📤 Sending POST request to Colab...")
+        logger.info(f"   │ ⏰ Request started at: {start_time.strftime('%H:%M:%S')}")
+        
+        # Send audio URL to Colab LLM for transcription
+        response = requests.post(
+            COLAB_API_URL,
+            json={
+                "audio_url": audio_url,
+                "room_name": room_name
+            },
+            timeout=None  # No timeout - allow any duration
+        )
+        
+        end_time = datetime.now()
+        elapsed = (end_time - start_time).total_seconds()
+        
+        logger.info(f"   │ 📥 Response received from Colab")
+        logger.info(f"   │ ⏰ Response time: {elapsed:.2f} seconds")
+        logger.info(f"   │ 📊 Status code: {response.status_code}")
+        logger.info(f"   ├─────────────────────────────────────────────────")
+        
+        if response.status_code == 200:
+            logger.info(f"   │ ✅ HTTP 200 OK - Parsing response...")
+            result = response.json()
+            transcription = result.get("transcription", "")
+            
+            logger.info(f"   │ 📝 Transcription length: {len(transcription)} characters")
+            logger.info(f"   │ 🎵 Audio duration: {result.get('audio_duration_seconds', 0):.2f}s")
+            logger.info(f"   │ 📊 Sample rate: {result.get('sample_rate', 0)}Hz")
+            logger.info(f"   │ ✅ Status: {result.get('status', 'unknown')}")
+            
+            if transcription:
+                logger.info(f"   │ 📄 Preview: {transcription[:100]}...")
+                logger.info(f"   │ ✅ Transcription successful!")
+                logger.info(f"   └─────────────────────────────────────────────────")
+                return transcription
+            else:
+                logger.error(f"   │ ❌ Colab returned empty transcription")
+                logger.error(f"   │ 📋 Full response: {result}")
+                logger.info(f"   └─────────────────────────────────────────────────")
+                return None
+        else:
+            logger.error(f"   │ ❌ HTTP {response.status_code} - Request failed")
+            logger.error(f"   │ 📋 Response: {response.text[:200]}")
+            logger.info(f"   └─────────────────────────────────────────────────")
             return None
-        
-        with open(audio_file_path, "rb") as audio_file:
-            transcription = groq.audio.transcriptions.create(
-                file=audio_file,
-                model="whisper-large-v3",
-                response_format="text",
-                language="en"
-            )
-        
-        return transcription
-        
+            
+    except requests.exceptions.Timeout:
+        logger.error(f"   │ ⏱️ ❌ TIMEOUT (This should not happen with unlimited timeout)")
+        logger.error(f"   │ ℹ️ Check network connection")
+        logger.info(f"   └─────────────────────────────────────────────────")
+        return None
+    except requests.exceptions.ConnectionError:
+        logger.error(f"   │ 🔌 ❌ CONNECTION ERROR")
+        logger.error(f"   │ ℹ️ Cannot connect to: {COLAB_API_URL}")
+        logger.error(f"   │ ℹ️ Possible causes:")
+        logger.error(f"   │    - Colab server not running")
+        logger.error(f"   │    - ngrok tunnel expired")
+        logger.error(f"   │    - Wrong URL in .env file")
+        logger.error(f"   │ ℹ️ Check Colab output for ngrok URL")
+        logger.info(f"   └─────────────────────────────────────────────────")
+        return None
     except Exception as err:
-        logger.error(f"Transcription error: {err}")
+        logger.error(f"   │ ❌ UNEXPECTED ERROR: {err}")
+        import traceback
+        logger.error(f"   │ Traceback:")
+        for line in traceback.format_exc().split('\n'):
+            if line.strip():
+                logger.error(f"   │   {line}")
+        logger.info(f"   └─────────────────────────────────────────────────")
         return None
 
 async def generate_summary(transcript: str, recording_data: Dict) -> Optional[Dict]:
     """Generate meeting summary using Groq Llama API"""
+    logger.info(f"   ┌─────────────────────────────────────────────────")
+    logger.info(f"   │ GROQ SUMMARY GENERATION - DETAILED LOG")
+    logger.info(f"   ├─────────────────────────────────────────────────")
+    
     try:
         groq = get_groq_client()
         if not groq:
-            logger.error("Groq client not initialized (missing API key)")
+            logger.error(f"   │ ❌ Groq client not initialized (missing API key)")
+            logger.error(f"   │ ℹ️ Check GROQ_API_KEY in .env file")
+            logger.info(f"   └─────────────────────────────────────────────────")
             return None
         
         duration_min = int(recording_data['duration'] / 60)
+        
+        logger.info(f"   │ 📝 Transcript length: {len(transcript)} characters")
+        logger.info(f"   │ ⏱️ Meeting duration: {duration_min} minutes")
+        logger.info(f"   │ 🤖 Model: llama-3.1-70b-versatile")
+        logger.info(f"   │ 🌡️ Temperature: 0.3")
+        logger.info(f"   │ 📊 Max tokens: 1500")
+        logger.info(f"   ├─────────────────────────────────────────────────")
+        logger.info(f"   │ 📤 Sending request to Groq API...")
         
         prompt = f"""You are an AI assistant that creates concise meeting summaries. 
 
@@ -696,22 +852,60 @@ Return ONLY valid JSON, no markdown formatting."""
             max_tokens=1500
         )
         
+        logger.info(f"   │ 📥 Response received from Groq")
+        
         summary_text = response.choices[0].message.content.strip()
+        logger.info(f"   │ 📝 Response length: {len(summary_text)} characters")
+        logger.info(f"   ├─────────────────────────────────────────────────")
+        logger.info(f"   │ 🔄 Parsing JSON response...")
         
         # Try to parse as JSON
         import json
         try:
             # Remove markdown code blocks if present
             if summary_text.startswith("```"):
+                logger.info(f"   │ ℹ️ Removing markdown code blocks...")
                 summary_text = summary_text.split("```")[1]
                 if summary_text.startswith("json"):
                     summary_text = summary_text[4:]
                 summary_text = summary_text.strip()
             
             summary_json = json.loads(summary_text)
+            logger.info(f"   │ ✅ JSON parsed successfully")
+            logger.info(f"   │ 🎯 Key topics: {len(summary_json.get('key_topics', []))}")
+            logger.info(f"   │ 💡 Important points: {len(summary_json.get('important_points', []))}")
+            logger.info(f"   │ ✓ Action items: {len(summary_json.get('action_items', []))}")
+            logger.info(f"   └─────────────────────────────────────────────────")
+            logger.info(f"")
+            logger.info(f"{'='*60}")
+            logger.info(f"🤖 GROQ LLAMA OUTPUT - SUMMARY")
+            logger.info(f"{'='*60}")
+            logger.info(f"Summary: {summary_json.get('summary', '')}")
+            logger.info(f"")
+            logger.info(f"Key Topics:")
+            for i, topic in enumerate(summary_json.get('key_topics', []), 1):
+                logger.info(f"  {i}. {topic}")
+            logger.info(f"")
+            logger.info(f"Important Points:")
+            for i, point in enumerate(summary_json.get('important_points', []), 1):
+                logger.info(f"  {i}. {point}")
+            logger.info(f"")
+            logger.info(f"Action Items:")
+            action_items = summary_json.get('action_items', [])
+            if action_items:
+                for i, item in enumerate(action_items, 1):
+                    logger.info(f"  {i}. {item}")
+            else:
+                logger.info(f"  (none)")
+            logger.info(f"{'='*60}")
+            logger.info(f"✅ Above summary was generated by GROQ LLAMA MODEL")
+            logger.info(f"{'='*60}")
+            logger.info(f"")
             return summary_json
-        except json.JSONDecodeError:
-            logger.error("Failed to parse summary as JSON, returning as text")
+        except json.JSONDecodeError as je:
+            logger.error(f"   │ ⚠️ JSON parsing failed: {je}")
+            logger.error(f"   │ ℹ️ Returning as plain text fallback")
+            logger.info(f"   └─────────────────────────────────────────────────")
             return {
                 "summary": summary_text,
                 "key_topics": [],
@@ -720,7 +914,13 @@ Return ONLY valid JSON, no markdown formatting."""
             }
         
     except Exception as err:
-        logger.error(f"Summary generation error: {err}")
+        logger.error(f"   │ ❌ Summary generation error: {err}")
+        import traceback
+        logger.error(f"   │ Traceback:")
+        for line in traceback.format_exc().split('\n'):
+            if line.strip():
+                logger.error(f"   │   {line}")
+        logger.info(f"   └─────────────────────────────────────────────────")
         return None
 
 @app.get('/api/recording/summary/{room_name}')
