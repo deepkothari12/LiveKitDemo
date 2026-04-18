@@ -13,6 +13,7 @@ __pycache__/
 # Temporary recordings and transcripts
 recordings/
 transcripts/
+cleaned-audio/
 
 # IDE settings
 .vscode/
@@ -22,9 +23,4 @@ transcripts/
 .DS_Store
 Thumbs.db
 
-# Setup script (not needed for deployment)
-setup.py
-
-*.md
-
-colab_server_improved.py
+FIXED_COLAB_CODE.py

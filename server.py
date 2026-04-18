@@ -39,6 +39,7 @@ from livekit.api import (
     TokenVerifier, WebhookReceiver
 )
 from livekit.protocol import room as proto_room
+from livekit.protocol import models
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -50,8 +51,8 @@ AWS_S3_REGION = os.getenv('AWS_S3_REGION', 'us-east-1')
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 
-# Groq API Configuration
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+# Groq API Configuration (DEPRECATED - not used, kept for backward compatibility)
+# GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
 # Colab LLM API Configuration
 COLAB_API_URL = os.getenv('COLAB_API_URL')
@@ -89,8 +90,11 @@ app.add_middleware(
 # LiveKit API client (created lazily)
 livekit_api = None
 
-# Groq client (created lazily)
-groq_client = None
+# Groq client (DEPRECATED - not used)
+# groq_client = None
+
+# Speaker diarization handler (created lazily)
+speaker_diarization_handler = None
 
 async def get_livekit_api():
     """Get or create LiveKit API client"""
@@ -103,13 +107,35 @@ async def get_livekit_api():
         )
     return livekit_api
 
-def get_groq_client():
-    """Get or create Groq client"""
-    global groq_client
-    if groq_client is None and GROQ_API_KEY:
-        from groq import Groq
-        groq_client = Groq(api_key=GROQ_API_KEY)
-    return groq_client
+# DEPRECATED: Groq is no longer used (using Colab with Gemma instead)
+# def get_groq_client():
+#     """Get or create Groq client"""
+#     global groq_client
+#     if groq_client is None and GROQ_API_KEY:
+#         from groq import Groq
+#         groq_client = Groq(api_key=GROQ_API_KEY)
+#     return groq_client
+
+def get_speaker_diarization_handler():
+    """Get or create speaker diarization handler"""
+    global speaker_diarization_handler
+    if speaker_diarization_handler is None:
+        import boto3
+        from speaker_diarization_handler import SpeakerDiarizationHandler
+        
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_S3_REGION
+        )
+        
+        speaker_diarization_handler = SpeakerDiarizationHandler(
+            s3_client=s3_client,
+            colab_api_url=COLAB_API_URL,
+            aws_s3_bucket=AWS_S3_BUCKET
+        )
+    return speaker_diarization_handler
 
 # Webhook receiver
 webhook_receiver = WebhookReceiver(
@@ -264,7 +290,7 @@ async def get_config():
 # ── RECORDING ENDPOINTS ────────────────────────────
 @app.post('/api/recording/start')
 async def start_recording(request: RecordingStartRequest):
-    """Start recording a room using LiveKit Egress with S3 storage"""
+    """Start recording with SPEAKER DIARIZATION - Records each participant separately"""
     room_name = request.roomName
     started_by = request.startedBy
     
@@ -306,12 +332,21 @@ async def start_recording(request: RecordingStartRequest):
         # Import egress types
         from livekit.protocol import egress as proto_egress
         
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        # S3 path for audio only (NO VIDEO)
-        audio_s3_key = f"recordings/{room_name}/{timestamp}_audio.mp3"
+        # Get current participants in the room
+        logger.info(f"📋 Getting participants for room \"{room_name}\"...")
+        participants_response = await api_client.room.list_participants(
+            proto_room.ListParticipantsRequest(room=room_name)
+        )
         
-        # Configure S3 upload for audio
+        participants = participants_response.participants
+        logger.info(f"👥 Found {len(participants)} participant(s) in room")
+        
+        # S3 path for composite audio (backup/fallback)
+        audio_s3_key = f"recordings/{room_name}/{timestamp}_composite_audio.mp3"
+        
+        # Configure S3 upload
         audio_s3_output = proto_egress.S3Upload(
             access_key=AWS_ACCESS_KEY_ID,
             secret=AWS_SECRET_ACCESS_KEY,
@@ -319,7 +354,7 @@ async def start_recording(request: RecordingStartRequest):
             bucket=AWS_S3_BUCKET
         )
         
-        # Create audio-only egress for transcription (NO VIDEO)
+        # Create composite audio egress (fallback)
         audio_egress_request = proto_egress.RoomCompositeEgressRequest(
             room_name=room_name,
             audio_only=True,
@@ -333,32 +368,90 @@ async def start_recording(request: RecordingStartRequest):
             ]
         )
         
-        # Start audio-only egress
+        # Start composite audio egress
         audio_egress_info = await api_client.egress.start_room_composite_egress(audio_egress_request)
+        logger.info(f"Started composite audio recording (fallback)")
         
-        # Store recording state (audio only)
+        # Start individual track recording for each participant
+        track_egress_ids = {}
+        participant_info = {}
+        
+        for participant in participants:
+            # Store participant info
+            participant_info[participant.sid] = {
+                'identity': participant.identity,
+                'name': participant.name or participant.identity,
+                'joined_at': datetime.now().isoformat()
+            }
+            
+            # Find audio track
+            audio_track_sid = None
+            for track in participant.tracks:
+                if track.type == models.TrackType.AUDIO:
+                    audio_track_sid = track.sid
+                    break
+            
+            if audio_track_sid:
+                # S3 path for this participant
+                # NOTE: LiveKit uploads individual tracks as .ogg, not .mp3
+                participant_s3_key = f"recordings/{room_name}/{timestamp}_{participant.identity}_audio.ogg"
+                
+                # Create track egress request
+                track_egress_request = proto_egress.TrackEgressRequest(
+                    room_name=room_name,
+                    track_id=audio_track_sid,
+                    file=proto_egress.DirectFileOutput(
+                        filepath=participant_s3_key,
+                        s3=audio_s3_output
+                    )
+                )
+                
+                try:
+                    track_egress_info = await api_client.egress.start_track_egress(track_egress_request)
+                    track_egress_ids[participant.identity] = {
+                        'egress_id': track_egress_info.egress_id,
+                        's3_key': participant_s3_key,
+                        'track_id': audio_track_sid
+                    }
+                    logger.info(f"   🎙️ Started track recording for {participant.identity}")
+                except Exception as track_err:
+                    logger.error(f"   ⚠️ Failed to start track for {participant.identity}: {track_err}")
+            else:
+                logger.warning(f"   ⚠️ No audio track found for {participant.identity}")
+        
+        # Store recording state
         active_recordings[room_name] = {
             'egressId': audio_egress_info.egress_id,
             'startedBy': started_by,
             'startTime': datetime.now(),
-            'audioS3Key': audio_s3_key
+            'audioS3Key': audio_s3_key,
+            'participantInfo': participant_info,
+            'trackEgressIds': track_egress_ids,
+            'timestamp': timestamp
         }
         
-        logger.info(f"🔴 Audio recording started for room \"{room_name}\" by \"{started_by}\" (egress: {audio_egress_info.egress_id})")
-        logger.info(f"📦 S3 Bucket: {AWS_S3_BUCKET}, Audio: {audio_s3_key}")
-        
+        logger.info(f"Recording started for room \"{room_name}\"")
+        logger.info(f"Composite: {audio_s3_key}")
+        logger.info(f"Individual tracks: {len(track_egress_ids)}")
+
         return {
             'success': True,
             'egressId': audio_egress_info.egress_id,
             'roomName': room_name,
             'startedBy': started_by,
-            'started': [f"Audio recording to S3 bucket: {AWS_S3_BUCKET}"],
+            'started': [
+                f"Composite audio: S3 bucket {AWS_S3_BUCKET}",
+                f"Individual tracks: {len(track_egress_ids)} participant(s)"
+            ],
             's3Bucket': AWS_S3_BUCKET,
-            'audioPath': audio_s3_key
+            'audioPath': audio_s3_key,
+            'participantCount': len(track_egress_ids),
+            'participants': list(track_egress_ids.keys()),
+            'speakerDiarization': len(track_egress_ids) > 0
         }
         
     except Exception as err:
-        logger.error(f"Failed to start recording for room \"{room_name}\": {err}")
+        logger.error(f"Failed to start recording: {err}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to start recording: {str(err)}")
@@ -395,31 +488,46 @@ async def stop_recording(request: RecordingStopRequest):
         api_client = await get_livekit_api()
         audio_egress_id = recording_info['egressId']
         audio_s3_key = recording_info.get('audioS3Key')
+        track_egress_ids = recording_info.get('trackEgressIds', {})
         
         # Import egress types for stop request
         from livekit.protocol import egress as proto_egress
         
-        # Stop audio egress session
+        # Stop composite audio egress
         stop_request_audio = proto_egress.StopEgressRequest(egress_id=audio_egress_id)
         await api_client.egress.stop_egress(stop_request_audio)
+        logger.info(f"   ⏹️ Stopped composite audio")
+        
+        # Stop ALL individual track egress sessions (including late joiners)
+        logger.info(f"   🔄 Stopping {len(track_egress_ids)} individual tracks...")
+        for speaker_name, track_info in track_egress_ids.items():
+            try:
+                stop_request_track = proto_egress.StopEgressRequest(egress_id=track_info['egress_id'])
+                await api_client.egress.stop_egress(stop_request_track)
+                logger.info(f"   ⏹️ Stopped track for {speaker_name}")
+            except Exception as track_err:
+                logger.error(f"   ⚠️ Failed to stop track for {speaker_name}: {track_err}")
         
         duration = (datetime.now() - recording_info['startTime']).total_seconds()
-        logger.info(f"⏹️ Audio recording stopped for room \"{room_name}\" (duration: {duration:.1f}s)")
+        logger.info(f"⏹️ Recording stopped for room \"{room_name}\" (duration: {duration:.1f}s)")
         
         # Store recording info for transcription
         recording_data = {
             'roomName': room_name,
             'audioS3Key': audio_s3_key,
             'duration': duration,
-            'startedBy': recording_info['startedBy']
+            'startedBy': recording_info['startedBy'],
+            'trackEgressIds': track_egress_ids,
+            'participantInfo': recording_info.get('participantInfo', {}),
+            'timestamp': recording_info.get('timestamp')
         }
         
         # Remove from active recordings
         del active_recordings[room_name]
         
-        # Start transcription and summary generation in background
-        if audio_s3_key and GROQ_API_KEY:
-            asyncio.create_task(process_recording_async(recording_data))
+        # Start transcription with speaker diarization in background (ALWAYS use JSON format)
+        if COLAB_API_URL:
+            asyncio.create_task(process_recording_with_speakers_async(recording_data))
             logger.info(f"🎙️ Starting AI transcription for room \"{room_name}\"")
         
         return {
@@ -427,7 +535,8 @@ async def stop_recording(request: RecordingStopRequest):
             'egressId': audio_egress_id,
             'roomName': room_name,
             'duration': duration,
-            'message': 'Recording stopped. Generating transcript and summary...' if audio_s3_key else 'Recording stopped successfully',
+            'message': 'Recording stopped. Generating transcript with speaker labels...' if track_egress_ids else 'Recording stopped. Generating transcript...',
+            'speakerCount': len(track_egress_ids),
             'files': {
                 'audio': f"s3://{AWS_S3_BUCKET}/{audio_s3_key}" if audio_s3_key else None,
                 'bucket': AWS_S3_BUCKET,
@@ -457,32 +566,187 @@ async def get_recording_status(room_name: str):
             'active': False
         }
 
-# ── TRANSCRIPTION & SUMMARY FUNCTIONS ──────────────
-async def process_recording_async(recording_data: Dict):
-    """Background task to transcribe and summarize recording"""
-    room_name = recording_data['roomName']
-    audio_s3_key = recording_data.get('audioS3Key')
 
+async def start_track_for_participant(room_name: str, participant):
+    """
+    Start track recording for a participant who joined after recording started
+    
+    Args:
+        room_name: Room name
+        participant: Participant object from webhook
+    """
+    if room_name not in active_recordings:
+        logger.warning(f"⚠️ No active recording for room {room_name}")
+        return
+    
+    recording_info = active_recordings[room_name]
+    
+    try:
+        api_client = await get_livekit_api()
+        
+        # Import egress types
+        from livekit.protocol import egress as proto_egress
+        
+        # CRITICAL FIX: Get fresh participant info from API
+        # The webhook participant object might not have tracks populated yet
+        logger.info(f"   📋 Fetching participant info from API...")
+        participants_response = await api_client.room.list_participants(
+            proto_room.ListParticipantsRequest(room=room_name)
+        )
+        
+        # Find this participant in the API response
+        target_participant = None
+        for p in participants_response.participants:
+            if p.identity == participant.identity:
+                target_participant = p
+                break
+        
+        if not target_participant:
+            logger.warning(f"⚠️ Participant {participant.identity} not found in room")
+            return
+        
+        # Find audio track for this participant (using fresh data from API)
+        audio_track_sid = None
+        for track in target_participant.tracks:
+            if track.type == models.TrackType.AUDIO:
+                audio_track_sid = track.sid
+                break
+        
+        if not audio_track_sid:
+            logger.warning(f"⚠️ No audio track found for {participant.identity}")
+            return
+        
+        # Use the same timestamp as the original recording
+        timestamp = recording_info.get('timestamp')
+        
+        # S3 path for this participant
+        # NOTE: LiveKit uploads individual tracks as .ogg, not .mp3
+        participant_s3_key = f"recordings/{room_name}/{timestamp}_{participant.identity}_audio.ogg"
+        
+        # Configure S3 upload (reuse from recording_info)
+        audio_s3_output = proto_egress.S3Upload(
+            access_key=AWS_ACCESS_KEY_ID,
+            secret=AWS_SECRET_ACCESS_KEY,
+            region=AWS_S3_REGION,
+            bucket=AWS_S3_BUCKET
+        )
+        
+        # Create track egress request
+        track_egress_request = proto_egress.TrackEgressRequest(
+            room_name=room_name,
+            track_id=audio_track_sid,
+            file=proto_egress.DirectFileOutput(
+                filepath=participant_s3_key,
+                s3=audio_s3_output
+            )
+        )
+        
+        # Start track egress
+        track_egress_info = await api_client.egress.start_track_egress(track_egress_request)
+        
+        # Update recording info with new participant
+        if 'trackEgressIds' not in recording_info:
+            recording_info['trackEgressIds'] = {}
+        
+        if 'participantInfo' not in recording_info:
+            recording_info['participantInfo'] = {}
+        
+        recording_info['trackEgressIds'][participant.identity] = {
+            'egress_id': track_egress_info.egress_id,
+            's3_key': participant_s3_key,
+            'track_id': audio_track_sid
+        }
+        
+        # Use target_participant (from API) instead of webhook participant
+        recording_info['participantInfo'][target_participant.sid] = {
+            'identity': participant.identity,
+            'name': target_participant.name or participant.identity,
+            'joined_at': datetime.now().isoformat()
+        }
+        
+        logger.info(f"✅ Started track recording for late joiner: {participant.identity}")
+        logger.info(f"   📦 S3 Key: {participant_s3_key}")
+        logger.info(f"   🎙️ Egress ID: {track_egress_info.egress_id}")
+        logger.info(f"   👤 Name: {target_participant.name or participant.identity}")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to start track for {participant.identity}: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+
+
+# ── TRANSCRIPTION & SUMMARY FUNCTIONS ──────────────
+async def process_recording_with_speakers_async(recording_data: Dict):
+    """Background task to transcribe with speaker diarization (JSON format) - ALWAYS"""
+    room_name = recording_data['roomName']
+    track_egress_ids = recording_data.get('trackEgressIds', {})
+    
     logger.info(f"{'='*60}")
-    logger.info(f"🎬 STARTING RECORDING PROCESSING PIPELINE")
+    logger.info(f"🎬 STARTING TRANSCRIPTION PIPELINE (JSON FORMAT)")
     logger.info(f"{'='*60}")
     logger.info(f"📍 Room: {room_name}")
-    logger.info(f"📁 S3 Key: {audio_s3_key}")
+    logger.info(f"👥 Speakers: {len(track_egress_ids)}")
     logger.info(f"⏱️ Duration: {recording_data.get('duration', 0):.1f}s")
-    logger.info(f"👤 Started by: {recording_data.get('startedBy', 'unknown')}")
-
-    if not audio_s3_key:
-        logger.error(f"❌ No audio S3 key provided for room \"{room_name}\"")
-        return
-
+    
     try:
-        logger.info(f"⏳ Step 1/7: Waiting 10 seconds for S3 upload to complete...")
-        # Wait a bit for S3 upload to complete
-        await asyncio.sleep(10)
-        logger.info(f"✅ Step 1/7: Wait complete, proceeding to S3 client initialization")
+        handler = get_speaker_diarization_handler()
+        
+        # Use speaker diarization if we have individual tracks
+        if track_egress_ids and len(track_egress_ids) > 0:
+            logger.info(f"🎭 Using speaker diarization (individual tracks)")
+            
+            transcript_data = await handler.process_multi_speaker_recording(
+                room_name=room_name,
+                recording_info=recording_data,
+                duration=recording_data['duration']
+            )
+            
+            if transcript_data:
+                logger.info(f"✅ Speaker-labeled transcript generated: {len(transcript_data['utterances'])} utterances")
+            else:
+                logger.error(f"❌ Speaker diarization failed, falling back to composite")
+                # Fallback to composite audio
+                transcript_data = await handler._transcribe_composite_audio(
+                    recording_data.get('audioS3Key'),
+                    room_name,
+                    recording_data  # Pass recording_info for participant name
+                )
+        else:
+            logger.info(f"ℹ️ No individual tracks, using composite audio")
+            # Use composite audio (still JSON format)
+            transcript_data = await handler._transcribe_composite_audio(
+                recording_data.get('audioS3Key'),
+                room_name,
+                recording_data  # Pass recording_info for participant name
+            )
+        
+        if not transcript_data:
+            logger.error(f"❌ Transcription failed completely")
+            return
+        
+        # Save JSON transcript to S3 only (not locally, not in UI)
+        await save_transcript_json_to_s3(room_name, transcript_data, recording_data)
+        
+        logger.info(f"{'='*60}")
+        logger.info(f"🎉 TRANSCRIPTION COMPLETE: {room_name}")
+        logger.info(f"{'='*60}")
+        
+    except Exception as e:
+        logger.error(f"❌ Transcription error: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
 
-        logger.info(f"⏳ Step 2/7: Initializing AWS S3 client...")
-        # Initialize S3 client
+
+
+async def save_transcript_json_to_s3(
+    room_name: str,
+    transcript_data: Dict,
+    recording_data: Dict
+):
+    """Save transcript JSON directly to S3 (not locally, not in UI)"""
+    logger.info(f"⏳ Saving transcript JSON to S3...")
+    
+    try:
         import boto3
         s3_client = boto3.client(
             's3',
@@ -490,210 +754,43 @@ async def process_recording_async(recording_data: Dict):
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
             region_name=AWS_S3_REGION
         )
-        logger.info(f"✅ Step 2/7: S3 client initialized successfully")
-        logger.info(f"   📦 Bucket: {AWS_S3_BUCKET}")
-        logger.info(f"   🌍 Region: {AWS_S3_REGION}")
-
-        # ═══════════════════════════════════════════════════════════════
-        # TRANSCRIPTION - Using Colab LLM with S3 Presigned URL
-        # ═══════════════════════════════════════════════════════════════
         
-        logger.info(f"⏳ Step 3/7: Generating S3 presigned URL...")
-        # Generate temporary presigned URL (valid for 1 hour)
-        try:
-            presigned_url = s3_client.generate_presigned_url(
-                'get_object',
-                Params={
-                    'Bucket': AWS_S3_BUCKET,
-                    'Key': audio_s3_key
-                },
-                ExpiresIn=3600  # URL expires in 1 hour
-            )
-            logger.info(f"✅ Step 3/7: Presigned URL generated successfully")
-            logger.info(f"   🔗 URL: {presigned_url[:80]}...")
-            logger.info(f"   ⏰ Expires in: 1 hour (3600 seconds)")
-        except Exception as e:
-            logger.error(f"❌ Step 3/7 FAILED: Could not generate presigned URL: {e}")
-            import traceback
-            logger.error(f"   Traceback: {traceback.format_exc()}")
-            return
-
-        logger.info(f"⏳ Step 4/7: Sending audio URL to Colab LLM for transcription...")
-        logger.info(f"   🎯 Target: {COLAB_API_URL}")
-        logger.info(f"   📍 Room: {room_name}")
-        logger.info(f"   ⚠️ This may take a while for long recordings...")
-        logger.info(f"   ⏱️ Estimated time: ~{int(recording_data.get('duration', 0) / 30 * 20)} seconds for {int(recording_data.get('duration', 0) / 30)} chunks")
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        s3_transcript_key = f"recordings/{room_name}/{timestamp_str}_transcript.json"
         
-        # Send audio URL to Colab LLM for transcription
-        transcript = await transcribe_audio_colab(presigned_url, room_name)
-
-        if not transcript:
-            logger.error(f"❌ Step 4/7 FAILED: Transcription failed for room \"{room_name}\"")
-            logger.error(f"   ⚠️ Check Colab server logs for details")
-            logger.error(f"   ⚠️ Verify COLAB_API_URL is correct: {COLAB_API_URL}")
-            return
-
-        logger.info(f"✅ Step 4/7: Transcription received from Colab")
-        logger.info(f"   📝 Length: {len(transcript)} characters")
-        logger.info(f"   📄 Preview: {transcript[:100]}...")
-        logger.info(f"")
-        logger.info(f"{'='*60}")
-        logger.info(f"🎯 COLAB MODEL OUTPUT - TRANSCRIPTION")
-        logger.info(f"{'='*60}")
-        logger.info(f"{transcript}")
-        logger.info(f"{'='*60}")
-        logger.info(f"✅ Above transcription was generated by YOUR COLAB LLM MODEL")
-        logger.info(f"{'='*60}")
-        logger.info(f"")
-
-        logger.info(f"⏳ Step 5/7: Generating AI summary using Groq Llama...")
-        # Generate summary using Groq Llama
-        summary = await generate_summary(transcript, recording_data)
-
-        if not summary:
-            logger.warning(f"⚠️ Step 5/7: Summary generation failed for room {room_name}, using fallback")
-            # Create fallback summary structure
-            summary = {
-                'summary': 'Summary generation failed. Please review the transcript below.',
-                'key_topics': [],
-                'important_points': [],
-                'action_items': []
-            }
-        else:
-            logger.info(f"✅ Step 5/7: Summary generated successfully")
-            logger.info(f"   🎯 Key topics: {len(summary.get('key_topics', []))}")
-            logger.info(f"   💡 Important points: {len(summary.get('important_points', []))}")
-            logger.info(f"   ✓ Action items: {len(summary.get('action_items', []))}")
-
-        logger.info(f"⏳ Step 6/7: Storing summary in memory...")
-        # Store summary
+        # Convert to JSON string
+        json_content = json.dumps(transcript_data, indent=2, ensure_ascii=False)
+        
+        # Upload directly to S3 (no local file)
+        s3_client.put_object(
+            Bucket=AWS_S3_BUCKET,
+            Key=s3_transcript_key,
+            Body=json_content.encode('utf-8'),
+            ContentType='application/json'
+        )
+        
+        logger.info(f"✅ Transcript JSON saved to S3: s3://{AWS_S3_BUCKET}/{s3_transcript_key}")
+        logger.info(f"📊 Summary:")
+        logger.info(f"   👥 Speakers: {len(transcript_data.get('speakers', []))}")
+        logger.info(f"   💬 Utterances: {len(transcript_data.get('utterances', []))}")
+        logger.info(f"   ⏱️ Duration: {int(recording_data['duration'] / 60)}m {int(recording_data['duration'] % 60)}s")
+        logger.info(f"   ☁️ S3: {s3_transcript_key}")
+        
+        # Store minimal info in memory (for API access, but not full transcript)
         meeting_summaries[room_name] = {
-            'transcript': transcript,
-            'summary': summary,
+            'transcript_s3_key': s3_transcript_key,
             'timestamp': datetime.now().isoformat(),
             'duration': recording_data['duration'],
-            'startedBy': recording_data['startedBy']
+            'startedBy': recording_data['startedBy'],
+            'speakerCount': len(transcript_data.get('speakers', [])),
+            'utteranceCount': len(transcript_data.get('utterances', [])),
+            'speakerDiarization': True
         }
-        logger.info(f"✅ Step 6/7: Summary stored in memory (accessible via API)")
-
-        logger.info(f"⏳ Step 7/7: Creating and saving transcript files...")
-        # Create comprehensive transcript file with summary
-        transcript_dir = Path("transcripts")
-        transcript_dir.mkdir(exist_ok=True)
-
-        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        transcript_filename = f"{room_name}_{timestamp_str}_transcript.txt"
-        transcript_path = transcript_dir / transcript_filename
         
-        logger.info(f"   📁 Local path: {transcript_path}")
-
-        # Format complete transcript with summary
-        transcript_content = f"""MEETING TRANSCRIPT & SUMMARY
-{'='*60}
-
-Room: {room_name}
-Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Duration: {int(recording_data['duration'] / 60)} minutes {int(recording_data['duration'] % 60)} seconds
-Started by: {recording_data['startedBy']}
-
-{'='*60}
-OVERVIEW
-{'='*60}
-
-{summary.get('summary', 'No summary available')}
-
-{'='*60}
-KEY TOPICS
-{'='*60}
-
-"""
-
-        for i, topic in enumerate(summary.get('key_topics', []), 1):
-            transcript_content += f"{i}. {topic}\n"
-
-        transcript_content += f"""
-{'='*60}
-IMPORTANT POINTS
-{'='*60}
-
-"""
-
-        for i, point in enumerate(summary.get('important_points', []), 1):
-            transcript_content += f"{i}. {point}\n"
-
-        transcript_content += f"""
-{'='*60}
-ACTION ITEMS
-{'='*60}
-
-"""
-
-        action_items = summary.get('action_items', [])
-        if action_items:
-            for i, item in enumerate(action_items, 1):
-                transcript_content += f"[ ] {i}. {item}\n"
-        else:
-            transcript_content += "No action items identified.\n"
-
-        transcript_content += f"""
-{'='*60}
-FULL TRANSCRIPT
-{'='*60}
-
-{transcript}
-
-{'='*60}
-End of Meeting Transcript
-{'='*60}
-"""
-
-        # Save transcript locally
-        logger.info(f"   💾 Saving to local file...")
-        with open(transcript_path, 'w', encoding='utf-8') as f:
-            f.write(transcript_content)
-        logger.info(f"   ✅ Local file saved: {transcript_path}")
-
-        # Upload transcript to S3
-        logger.info(f"   ☁️ Uploading to S3...")
-        try:
-            s3_transcript_key = f"recordings/{room_name}/{timestamp_str}_transcript.txt"
-
-            s3_client.upload_file(
-                str(transcript_path),
-                AWS_S3_BUCKET,
-                s3_transcript_key
-            )
-
-            logger.info(f"   ✅ S3 upload successful: s3://{AWS_S3_BUCKET}/{s3_transcript_key}")
-
-        except Exception as s3_err:
-            logger.error(f"   ⚠️ S3 upload failed: {s3_err}")
-            logger.error(f"   ℹ️ Local copy is still available at: {transcript_path}")
-            # Continue even if S3 upload fails - we have local copy
-
-        logger.info(f"✅ Step 7/7: Files saved successfully")
-        logger.info(f"{'='*60}")
-        logger.info(f"🎉 PROCESSING COMPLETE FOR ROOM: {room_name}")
-        logger.info(f"{'='*60}")
-        logger.info(f"📊 Summary Statistics:")
-        logger.info(f"   📝 Transcript: {len(transcript)} characters")
-        logger.info(f"   ⏱️ Duration: {int(recording_data['duration'] / 60)}m {int(recording_data['duration'] % 60)}s")
-        logger.info(f"   📄 File: {transcript_filename}")
-        logger.info(f"   📍 Local: {transcript_path}")
-        logger.info(f"   ☁️ S3: recordings/{room_name}/{timestamp_str}_transcript.txt")
-        logger.info(f"{'='*60}")
-        logger.info(f"📄 Transcript file: {transcript_filename}")
-        logger.info(f"📍 Local: {transcript_path}")
-        logger.info(f"☁️ S3: s3://{AWS_S3_BUCKET}/recordings/{room_name}/{timestamp_str}_transcript.txt")
-
-    except Exception as err:
-        logger.error(f"{'='*60}")
-        logger.error(f"❌ PROCESSING FAILED FOR ROOM: {room_name}")
-        logger.error(f"{'='*60}")
-        logger.error(f"Error: {err}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save transcript JSON to S3: {e}")
         import traceback
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-        logger.error(f"{'='*60}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
 
 
 
@@ -713,8 +810,8 @@ async def transcribe_audio_colab(audio_url: str, room_name: str) -> Optional[str
     logger.info(f"   ├─────────────────────────────────────────────────")
     
     if not COLAB_API_URL:
-        logger.error(f"   │ ❌ COLAB_API_URL not configured in .env file")
-        logger.error(f"   │ ℹ️ Add: COLAB_API_URL=https://your-ngrok-url.ngrok-free.dev/transcribe")
+        logger.error(f"   │ COLAB_API_URL not configured in .env file")
+        logger.error(f"   │ Add: COLAB_API_URL=https://your-ngrok-url.ngrok-free.dev/transcribe")
         logger.info(f"   └─────────────────────────────────────────────────")
         return None
     
@@ -722,10 +819,10 @@ async def transcribe_audio_colab(audio_url: str, room_name: str) -> Optional[str
         import requests
         from datetime import datetime
         
-        logger.info(f"   │ 🎯 Target URL: {COLAB_API_URL}")
-        logger.info(f"   │ 📍 Room: {room_name}")
-        logger.info(f"   │ 🔗 Audio URL: {audio_url[:80]}...")
-        logger.info(f"   │ ⏱️ Timeout: None (unlimited - can handle any duration)")
+        logger.info(f"Target URL: {COLAB_API_URL}")
+        logger.info(f"Room: {room_name}")
+        logger.info(f"Audio URL: {audio_url[:80]}...")
+        logger.info(f" Timeout: None (unlimited - can handle any duration)")
         logger.info(f"   ├─────────────────────────────────────────────────")
         
         start_time = datetime.now()
@@ -737,7 +834,8 @@ async def transcribe_audio_colab(audio_url: str, room_name: str) -> Optional[str
             COLAB_API_URL,
             json={
                 "audio_url": audio_url,
-                "room_name": room_name
+                "room_name": room_name,
+                "language": "en"  # "en" for English, "multilingual" for auto-detect
             },
             timeout=None  # No timeout - allow any duration
         )
@@ -801,10 +899,11 @@ async def transcribe_audio_colab(audio_url: str, room_name: str) -> Optional[str
         logger.info(f"   └─────────────────────────────────────────────────")
         return None
 
+# DEPRECATED: Summary generation is no longer used (JSON format only)
 async def generate_summary(transcript: str, recording_data: Dict) -> Optional[Dict]:
-    """Generate meeting summary using Groq Llama API"""
+    """Generate meeting summary using Groq Llama API (DEPRECATED - NOT USED)"""
     logger.info(f"   ┌─────────────────────────────────────────────────")
-    logger.info(f"   │ GROQ SUMMARY GENERATION - DETAILED LOG")
+    logger.info(f"   │ GROQ SUMMARY GENERATION - DEPRECATED (NOT USED)")
     logger.info(f"   ├─────────────────────────────────────────────────")
     
     try:
@@ -925,92 +1024,25 @@ Return ONLY valid JSON, no markdown formatting."""
 
 @app.get('/api/recording/summary/{room_name}')
 async def get_meeting_summary(room_name: str):
-    """Get meeting summary for a room"""
+    """Get meeting summary metadata (transcript is in S3, not returned here)"""
     if room_name not in meeting_summaries:
         raise HTTPException(status_code=404, detail="Summary not found. Recording may still be processing.")
     
-    return meeting_summaries[room_name]
-
-@app.get('/api/recording/summary/{room_name}/download')
-async def download_meeting_summary(room_name: str):
-    """Download meeting summary as text file"""
-    if room_name not in meeting_summaries:
-        raise HTTPException(status_code=404, detail="Summary not found")
-    
     summary_data = meeting_summaries[room_name]
     
-    # Format as readable text
-    text_content = f"""MEETING SUMMARY
-{'='*60}
-
-Room: {room_name}
-Date: {summary_data['timestamp']}
-Duration: {int(summary_data['duration'] / 60)} minutes
-Started by: {summary_data['startedBy']}
-
-{'='*60}
-OVERVIEW
-{'='*60}
-
-{summary_data['summary'].get('summary', 'No summary available')}
-
-{'='*60}
-KEY TOPICS
-{'='*60}
-
-"""
-    
-    for i, topic in enumerate(summary_data['summary'].get('key_topics', []), 1):
-        text_content += f"{i}. {topic}\n"
-    
-    text_content += f"""
-{'='*60}
-IMPORTANT POINTS
-{'='*60}
-
-"""
-    
-    for i, point in enumerate(summary_data['summary'].get('important_points', []), 1):
-        text_content += f"{i}. {point}\n"
-    
-    text_content += f"""
-{'='*60}
-ACTION ITEMS
-{'='*60}
-
-"""
-    
-    action_items = summary_data['summary'].get('action_items', [])
-    if action_items:
-        for i, item in enumerate(action_items, 1):
-            text_content += f"[ ] {i}. {item}\n"
-    else:
-        text_content += "No action items identified.\n"
-    
-    text_content += f"""
-{'='*60}
-FULL TRANSCRIPT
-{'='*60}
-
-{summary_data['transcript']}
-
-{'='*60}
-End of Meeting Summary
-{'='*60}
-"""
-    
-    # Return as downloadable file
-    from fastapi.responses import Response
-    
-    filename = f"meeting_summary_{room_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    
-    return Response(
-        content=text_content,
-        media_type="text/plain",
-        headers={
-            "Content-Disposition": f"attachment; filename={filename}"
-        }
-    )
+    # Return metadata only, not full transcript
+    return {
+        'room_name': room_name,
+        'timestamp': summary_data['timestamp'],
+        'duration': summary_data['duration'],
+        'startedBy': summary_data['startedBy'],
+        'speakerCount': summary_data.get('speakerCount', 0),
+        'utteranceCount': summary_data.get('utteranceCount', 0),
+        'speakerDiarization': summary_data.get('speakerDiarization', False),
+        'transcript_s3_key': summary_data.get('transcript_s3_key'),
+        'transcript_url': f"s3://{AWS_S3_BUCKET}/{summary_data.get('transcript_s3_key')}" if summary_data.get('transcript_s3_key') else None,
+        'message': 'Transcript is stored in S3. Download from S3 bucket to view.'
+    }
 
 @app.post('/api/webhook')
 async def webhook_handler(request: Request):
@@ -1083,10 +1115,10 @@ async def webhook_handler(request: Request):
                     # Remove from active recordings
                     del active_recordings[room_name]
                     
-                    # Start transcription in background
-                    if audio_s3_key and GROQ_API_KEY:
-                        asyncio.create_task(process_recording_async(recording_data))
-                        logger.info(f"🎙️ Starting AI transcription for room \"{room_name}\"")
+                    # Start transcription in background (DEPRECATED - this code path is not used)
+                    # if audio_s3_key:
+                    #     asyncio.create_task(process_recording_async(recording_data))
+                    #     logger.info(f"🎙️ Starting AI transcription for room \"{room_name}\"")
                     
                 except Exception as err:
                     logger.error(f"Failed to auto-stop recording: {err}")
@@ -1099,16 +1131,27 @@ async def webhook_handler(request: Request):
         
         elif event.event == 'participant_connected':
             room_name = event.room.name if event.room else None
-            # participant = event.participant
-            participant = even.participant
+            participant = event.participant
             
-            webhook_logger.info(f" PARTICIPANT CONNECTED")
-            webhook_logger.info(f" Room: {room_name}")
-            webhook_logger.info(f" Participant: {participant.identity if participant else 'N/A'}")
+            webhook_logger.info(f"👤 PARTICIPANT CONNECTED")
+            webhook_logger.info(f"   Room: {room_name}")
+            webhook_logger.info(f"   Participant: {participant.identity if participant else 'N/A'}")
             
             if room_name and participant:
-                logger.info(f" Participant {participant.identity} joined room \"{room_name}\"")
-        ### This logic is working fine but the concept 
+                logger.info(f"👤 Participant {participant.identity} joined room \"{room_name}\"")
+                
+                # Check if recording is active for this room
+                if room_name in active_recordings:
+                    logger.info(f"🔴 Recording is active, starting track for late joiner: {participant.identity}")
+                    webhook_logger.info(f"   🎙️ Starting track recording for late joiner")
+                    
+                    try:
+                        # Start track recording for this participant
+                        await start_track_for_participant(room_name, participant)
+                    except Exception as e:
+                        logger.error(f"❌ Failed to start track for late joiner {participant.identity}: {e}")
+                        webhook_logger.error(f"   ❌ Track recording failed: {e}")
+        
         elif event.event == 'participant_disconnected':
             room_name = event.room.name if event.room else None
             participant = event.participant
@@ -1119,6 +1162,45 @@ async def webhook_handler(request: Request):
             
             if room_name and participant:
                 logger.info(f" Participant {participant.identity} left room \"{room_name}\"")
+        
+        elif event.event == 'egress_ended':
+            # This is the critical event for recording completion!
+            egress_info = event.egress_info
+            room_name = egress_info.room_name if egress_info else None
+            
+            webhook_logger.info(f"🎬 EGRESS ENDED (RECORDING COMPLETE)")
+            webhook_logger.info(f"   Room: {room_name}")
+            webhook_logger.info(f"   Egress ID: {egress_info.egress_id if egress_info else 'N/A'}")
+            webhook_logger.info(f"   Status: {egress_info.status if egress_info else 'N/A'}")
+            
+            if room_name and room_name in active_recordings:
+                recording_info = active_recordings[room_name]
+                duration = (datetime.now() - recording_info['startTime']).total_seconds()
+                
+                logger.info(f"🎬 Recording completed for room \"{room_name}\" (duration: {duration:.1f}s)")
+                webhook_logger.info(f"   Duration: {duration:.1f}s")
+                
+                # Prepare recording data for transcription
+                recording_data = {
+                    'roomName': room_name,
+                    'audioS3Key': recording_info.get('audioS3Key'),
+                    'trackEgressIds': recording_info.get('trackEgressIds', {}),
+                    'participantInfo': recording_info.get('participantInfo', {}),
+                    'duration': duration,
+                    'startedBy': recording_info['startedBy'],
+                    'timestamp': recording_info.get('timestamp')
+                }
+                
+                # Remove from active recordings
+                del active_recordings[room_name]
+                
+                # Start transcription in background
+                logger.info(f"🎙️ Starting transcription pipeline for room \"{room_name}\"")
+                webhook_logger.info(f"   🎙️ Starting transcription pipeline")
+                asyncio.create_task(process_recording_with_speakers_async(recording_data))
+            else:
+                logger.warning(f"⚠️ Egress ended but no active recording found for room: {room_name}")
+                webhook_logger.warning(f"   ⚠️ No active recording found")
         
         else:
             logger.info(f"  Unhandled webhook event: {event.event}")
