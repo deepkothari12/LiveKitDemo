@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 from pathlib import Path
 import boto3
 import requests
-from audio_cleaner import AudioCleaner
+from audio_cleaner_enhanced import EnhancedAudioCleaner
 
 logger = logging.getLogger('speaker_diarization')
 
@@ -25,7 +25,7 @@ class SpeakerDiarizationHandler:
         self.s3_client = s3_client
         self.colab_api_url = colab_api_url
         self.aws_s3_bucket = aws_s3_bucket
-        self.audio_cleaner = AudioCleaner()  # Initialize audio cleaner
+        self.audio_cleaner = EnhancedAudioCleaner()  # Use ENHANCED audio cleaner (95% noise removal)
         
         # Create cleaned-audio folder if it doesn't exist
         self.cleaned_audio_dir = Path("cleaned-audio")
@@ -125,24 +125,45 @@ class SpeakerDiarizationHandler:
         
         # Transcribe each participant's audio separately
         all_utterances = []
+        speaker_join_times = {}  # Track when each speaker joined
         
-        for speaker_identity, track_info in track_egress_ids.items():
+        for idx, (speaker_identity, track_info) in enumerate(track_egress_ids.items()):
             s3_key = track_info['s3_key']
             
-            # Find display name
+            # Find display name and join time
             display_name = speaker_identity
+            join_time_offset = 0
+            
             for pid, pinfo in participant_info.items():
                 if pinfo['identity'] == speaker_identity:
                     display_name = pinfo['name']
+                    # Use join time if available, otherwise estimate based on order
+                    if 'joined_at' in pinfo:
+                        # Parse ISO format timestamp
+                        try:
+                            from dateutil import parser
+                            join_dt = parser.parse(pinfo['joined_at'])
+                            # Calculate offset from first participant
+                            if idx == 0:
+                                speaker_join_times['first'] = join_dt
+                            else:
+                                join_time_offset = (join_dt - speaker_join_times['first']).total_seconds() * 1000  # Convert to ms
+                        except:
+                            # Fallback: estimate 5 seconds between each speaker
+                            join_time_offset = idx * 5000
+                    else:
+                        # Estimate: each speaker joins 5 seconds apart
+                        join_time_offset = idx * 5000
                     break
             
-            logger.info(f"🎙️ Transcribing {display_name}...")
+            logger.info(f"🎙️ Transcribing {display_name} (offset: {join_time_offset}ms)...")
             
             utterances = await self._transcribe_speaker_track_detailed(
                 s3_key, 
                 speaker_identity,
                 display_name,
-                room_name
+                room_name,
+                time_offset_ms=join_time_offset  # Pass offset to adjust timestamps
             )
             
             if utterances:
@@ -172,6 +193,30 @@ class SpeakerDiarizationHandler:
         }
         
         logger.info(f"✅ Speaker diarization complete: {len(all_utterances)} utterances")
+        
+        # Generate full merged transcript
+        logger.info(f"📝 Generating full merged transcript...")
+        full_transcript = self._generate_full_transcript(result)
+        
+        # Upload full transcript to S3
+        transcript_s3_key = f"transcripts/{room_name}_full_transcript.txt"
+        logger.info(f"📤 Uploading full transcript to S3: {transcript_s3_key}")
+        
+        try:
+            self.s3_client.put_object(
+                Bucket=self.aws_s3_bucket,
+                Key=transcript_s3_key,
+                Body=full_transcript.encode('utf-8'),
+                ContentType='text/plain; charset=utf-8'
+            )
+            logger.info(f"✅ Full transcript uploaded to S3")
+            
+            # Add transcript location to result
+            result["full_transcript_s3_key"] = transcript_s3_key
+            
+        except Exception as e:
+            logger.error(f"⚠️ Failed to upload full transcript to S3: {e}")
+        
         return result
     
     async def _transcribe_speaker_track_detailed(
@@ -179,7 +224,8 @@ class SpeakerDiarizationHandler:
         s3_key: str, 
         speaker_identity: str,
         speaker_name: str,
-        room_name: str
+        room_name: str,
+        time_offset_ms: int = 0  # Offset to adjust timestamps for when speaker joined
     ) -> Optional[List[Dict]]:
         """
         Transcribe a single speaker's audio track with detailed utterances
@@ -264,28 +310,52 @@ class SpeakerDiarizationHandler:
                 result = response.json()
                 logger.info(f"   ✅ Response received successfully")
                 
-                # Check if detailed format is returned
-                if "utterances" in result:
-                    # Colab returned detailed format
+                # Check if detailed format with timestamps is returned
+                if "utterances" in result and result["utterances"]:
+                    # Colab returned detailed format with REAL timestamps
                     utterances = result["utterances"]
-                    logger.info(f"   📊 Detailed format: {len(utterances)} utterances")
+                    logger.info(f"   📊 Detailed format with timestamps: {len(utterances)} utterances")
+                    
+                    # Convert to our format
+                    formatted_utterances = []
+                    for utt in utterances:
+                        formatted_utterances.append({
+                            "speaker_identity": speaker_identity,
+                            "speaker_name": speaker_name,
+                            "track_id": speaker_identity,
+                            "start_ms": utt.get("start_ms", 0),
+                            "end_ms": utt.get("end_ms", 0),
+                            "language": result.get("language", "en"),
+                            "original_text": utt.get("text", ""),
+                            "english_text": utt.get("text", "")
+                        })
+                    
+                    utterances = formatted_utterances
+                    logger.info(f"   ✅ Using REAL timestamps from Colab")
                 else:
-                    # Colab returned simple format, convert it
+                    # Colab returned simple format, convert it (ESTIMATED timestamps)
                     transcription = result.get("transcription", "")
                     logger.info(f"   📝 Simple format: {len(transcription)} chars, converting...")
+                    logger.warning(f"   ⚠️ Using ESTIMATED timestamps (update Colab for real timestamps)")
                     utterances = self._convert_simple_to_detailed(
                         transcription,
                         speaker_identity,
                         speaker_name,
                         result  # Pass full Colab response for language/translation info
                     )
-                    logger.info(f"   ✅ Converted to {len(utterances)} utterances")
+                    logger.info(f"   ✅ Converted to {len(utterances)} utterances (estimated timestamps)")
                 
                 # Add speaker info and cleaning metadata to each utterance
                 for utterance in utterances:
+                    # Ensure speaker info is set
                     utterance["speaker_identity"] = speaker_identity
                     utterance["speaker_name"] = speaker_name
                     utterance["track_id"] = speaker_identity
+                    
+                    # Adjust timestamps with offset (for speaker join time)
+                    utterance["start_ms"] += time_offset_ms
+                    utterance["end_ms"] += time_offset_ms
+                    
                     if cleaning_metadata:
                         utterance["audio_cleaned"] = True
                         utterance["cleaning_metadata"] = cleaning_metadata
@@ -361,6 +431,62 @@ class SpeakerDiarizationHandler:
             current_time += duration_ms + 500  # Add 500ms pause between sentences
         
         return utterances
+    
+    def _generate_full_transcript(self, result: Dict) -> str:
+        """
+        Generate full merged transcript from JSON result
+        
+        Args:
+            result: Complete JSON structure with speakers and utterances
+            
+        Returns:
+            Formatted full transcript as string
+        """
+        lines = []
+        
+        # Header
+        lines.append("=" * 70)
+        lines.append("FULL MERGED TRANSCRIPT")
+        lines.append("=" * 70)
+        lines.append("")
+        lines.append(f"Room: {result['room_name']}")
+        lines.append(f"Generated: {result['generated_at']}")
+        lines.append(f"Total Utterances: {len(result['utterances'])}")
+        lines.append("")
+        
+        # Speakers
+        speaker_names = [s['display_name'] for s in result['speakers']]
+        lines.append(f"Speakers: {', '.join(speaker_names)}")
+        lines.append("")
+        
+        # Utterance distribution
+        lines.append("Utterance Distribution:")
+        for speaker in result['speakers']:
+            speaker_name = speaker['display_name']
+            count = sum(1 for u in result['utterances'] if u['speaker_name'] == speaker_name)
+            lines.append(f"  {speaker_name}: {count} utterances")
+        lines.append("")
+        
+        lines.append("=" * 70)
+        lines.append("CONVERSATION")
+        lines.append("=" * 70)
+        lines.append("")
+        
+        # Full conversation (merged)
+        conversation_parts = []
+        for utterance in result['utterances']:
+            speaker = utterance['speaker_name']
+            text = utterance['original_text']
+            conversation_parts.append(f"{speaker}: {text}")
+        
+        lines.append(" ".join(conversation_parts))
+        lines.append("")
+        
+        lines.append("=" * 70)
+        lines.append("END OF TRANSCRIPT")
+        lines.append("=" * 70)
+        
+        return "\n".join(lines)
     
     async def _transcribe_composite_audio(
         self, 

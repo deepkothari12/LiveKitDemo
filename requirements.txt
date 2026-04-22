@@ -22,10 +22,12 @@ librosa>=0.10.0
 soundfile>=0.12.0
 noisereduce>=3.0.0
 numpy>=1.24.0
+scipy>=1.11.0
 
 # Additional utilities
 pydantic>=2.5.0
 typing-extensions>=4.8.0
+python-dateutil>=2.8.0
 
 # Test dependencies (optional)
 pytest>=7.0.0

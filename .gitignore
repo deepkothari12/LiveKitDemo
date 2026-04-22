@@ -24,3 +24,8 @@ cleaned-audio/
 Thumbs.db
 
 FIXED_COLAB_CODE.py
+
+test-transcripts
+test_full_transcription.py
+test_multi_speaker.py
+test_transcription.py
